@@ -1,174 +1,219 @@
+# -*- coding: utf-8 -*-
 from burp import IBurpExtender, ITab, IHttpListener
 from javax.swing import JPanel, JButton, JFileChooser, JLabel, JTextField, JTextArea, Timer, JScrollPane
+from java.awt import FlowLayout  
+from javax.swing import BoxLayout
 from javax.swing.filechooser import FileNameExtensionFilter
-from java.awt import BorderLayout
+from java.awt import BorderLayout, Dimension
 import threading
+import re
+import os
 
 '''
-Read file, and adds the contents into the headers. Works with (Repeater,Proxy,Intruder).
+This Burp Suite extension injects HTTP headers into requests by reading values from a file. 
+It's useful for dynamically updating authentication tokens or API keys from CLI tools, scripts, or external sources.
 
+Example:
+aws sso get-bearer-token > token.txt
+The extension reads token.txt and injects the token into Burp Proxy, Repeater, and Intruder.
+
+How to Use  
+1. Allowed Hosts (Recommended) – Enter domains to limit where headers are injected (e.g., `*.example.com`). If left blank, headers may be sent to all requests, including telemetry services.  
+2. Header Name – Enter the header to replace (e.g., `Authorization`, `X-API-Key`). Do not include :  
+3. Load Header Value – Select the file containing the header value. The extension extracts only the content after : from the file, if a header name is present in the file.  
+4. Automatic Injection – The extension removes any existing instance of the specified header and injects the new value into every matching request.  
+
+This makes API testing and pentesting easier by automating token injection without manual copy-pasting. 
 '''
 
 class BurpExtender(IBurpExtender, ITab, IHttpListener):
 
     def registerExtenderCallbacks(self, callbacks):
-        # Save callbacks and helpers.
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
-        callbacks.setExtensionName("Auth Header Injector")
-        
-        # Global variable to hold the auth header (e.g. "Authorization: Bearer <token>")
-        self.auth_header = None
-        # Timer instance; will be created when auto-refresh is started.
-        self.autoRefreshTimer = None
+        callbacks.setExtensionName("Header Injector")
 
-        # Create the UI panel for our extension.
+        self.auth_header = None
+        self.autoRefreshTimer = None
+        self.allowed_hosts = "*"  
+        self.target_header = "Authorization"  # Default header to modify
+
+        # Create main panel
         self.panel = JPanel(BorderLayout())
-        top_panel = JPanel()  # Panel to hold our UI components
-        
-        # Text field to display the file path.
-        self.file_path_field = JTextField(30)
-        # Button to load the file.
+        main_panel = JPanel()
+        main_panel.setLayout(BoxLayout(main_panel, BoxLayout.Y_AXIS))  
+
+        # Allowed Hosts UI Section 
+        filter_panel = JPanel(FlowLayout(FlowLayout.LEFT))  
+        filter_panel.add(JLabel("Allowed Host (Prevent sensitive headers from being sent to 3rd party services i.e telemetry): "))
+        self.allowed_hosts_field = JTextField(20)
+        self.allowed_hosts_field.setPreferredSize(Dimension(200, 25))  
+        self.set_hosts_button = JButton("Set Allowed Hosts", actionPerformed=self.setAllowedHosts)
+        filter_panel.add(self.allowed_hosts_field)
+        filter_panel.add(self.set_hosts_button)
+        main_panel.add(filter_panel)
+
+        # Header Selection UI Section (User must enter only header name)
+        header_panel = JPanel(FlowLayout(FlowLayout.LEFT))  
+        header_panel.add(JLabel("Header to Replace (e.g., Authorization, X-API-Key):"))
+        self.target_header_field = JTextField(20)
+        self.target_header_field.setPreferredSize(Dimension(200, 25))  
+        self.set_header_button = JButton("Set Header", actionPerformed=self.setTargetHeader)
+        header_panel.add(self.target_header_field)
+        header_panel.add(self.set_header_button)
+        main_panel.add(header_panel)
+
+        # File Selection UI Section 
+        file_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        file_panel.add(JLabel("File Containing Header Value:"))
+        self.file_path_field = JTextField(20)
+        self.file_path_field.setPreferredSize(Dimension(200, 25))  
         self.load_button = JButton("Select File", actionPerformed=self.loadFile)
-        # Button to manually refresh (re-read) the file.
         self.refresh_button = JButton("Read File", actionPerformed=self.refreshFile)
-        
-        # New components for auto refresh:
-        self.interval_field = JTextField("10", 5)  # default interval in seconds
+        file_panel.add(self.file_path_field)
+        file_panel.add(self.load_button)
+        file_panel.add(self.refresh_button)
+        main_panel.add(file_panel)
+
+        # Auto-Refresh UI Section 
+        refresh_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        refresh_panel.add(JLabel("Read File Contents Every (seconds):"))
+        self.interval_field = JTextField("10", 5)
+        self.interval_field.setPreferredSize(Dimension(60, 25))  
         self.start_timer_button = JButton("Start Auto Refresh", actionPerformed=self.startAutoRefresh)
         self.stop_timer_button = JButton("Stop Auto Refresh", actionPerformed=self.stopAutoRefresh)
-        
-        # Add components to the top panel.
-        top_panel.add(JLabel("File: "))
-        top_panel.add(self.file_path_field)
-        top_panel.add(self.load_button)
-        top_panel.add(self.refresh_button)
-        top_panel.add(JLabel("Read File Contents Every (seconds): "))
-        top_panel.add(self.interval_field)
-        top_panel.add(self.start_timer_button)
-        top_panel.add(self.stop_timer_button)
-        
-        self.panel.add(top_panel, BorderLayout.NORTH)
-        
-        # Create a text area (wrapped in a scroll pane) to display the file contents.
-        self.file_contents_area = JTextArea(10, 50)
+        refresh_panel.add(self.interval_field)
+        refresh_panel.add(self.start_timer_button)
+        refresh_panel.add(self.stop_timer_button)
+        main_panel.add(refresh_panel)
+
+        # File Contents Display UI Section  (Smaller Text Area)
+        self.file_contents_area = JTextArea(5, 50)
         self.file_contents_area.setEditable(False)
         scroll_pane = JScrollPane(self.file_contents_area)
-        self.panel.add(scroll_pane, BorderLayout.CENTER)
-        
-        # Register our extension tab with Burp.
+        scroll_pane.setPreferredSize(Dimension(400, 80))  
+        main_panel.add(scroll_pane)
+
+        self.panel.add(main_panel, BorderLayout.NORTH)
+
         callbacks.addSuiteTab(self)
-        # Register this extension as an HTTP listener.
         callbacks.registerHttpListener(self)
 
-    #
-    # ITab methods
-    #
     def getTabCaption(self):
-        return "File Read Header Injector"
-    
+        return "Header Injector"
+
     def getUiComponent(self):
         return self.panel
 
-    #
-    # UI methods
-    #
     def loadFile(self, event):
-        """Open a file chooser to select the file that holds the auth header."""
         chooser = JFileChooser()
-        # For example, we expect a plain text file.
         file_filter = FileNameExtensionFilter("Text Files", ["txt"])
         chooser.setFileFilter(file_filter)
         if chooser.showOpenDialog(self.panel) == JFileChooser.APPROVE_OPTION:
             file = chooser.getSelectedFile()
-            # Show the file path in the text field.
             self.file_path_field.setText(file.getAbsolutePath())
-            # Read the header from the file.
             self.readAuthHeader(file.getAbsolutePath())
 
     def refreshFile(self, event):
-        """Re-read the file from the saved file path (in case it has been updated)."""
         file_path = self.file_path_field.getText()
         if file_path:
             self.readAuthHeader(file_path)
 
     def readAuthHeader(self, file_path):
-        """Read the header value from the specified file and update the UI."""
+        """Reads the header value from the specified file and removes the header name if present."""
         try:
-            f = open(file_path, "r")
-            # Read the entire file and strip whitespace.
-            contents = f.read().strip()
-            f.close()
-            self.auth_header = contents
-            print "Auth header loaded:", self.auth_header
-            # Update the text area with the file contents.
-            self.file_contents_area.setText(contents)
+            if not os.path.isfile(file_path):
+                raise ValueError("File does not exist.")
+
+            with open(file_path, "r") as f:
+                contents = f.read().strip()
+                if not contents:
+                    raise ValueError("File is empty.")
+
+                # Check if the file content starts with "Header-Name: " and remove it
+                if ":" in contents:
+                    header_parts = contents.split(":", 1)  # Split only at the first colon
+                    contents = header_parts[1].strip()  # Keep only the value after ':'
+
+                self.auth_header = contents
+                print("Header value loaded:", self.auth_header)
+                self.file_contents_area.setText(contents)
+
         except Exception as e:
-            print "Failed to load auth header:", str(e)
+            error_message = "Error loading file: " + str(e)
+            print(error_message)
             self.auth_header = None
-            self.file_contents_area.setText("Error loading file.")
+            self.file_contents_area.setText(error_message)
+
 
     def startAutoRefresh(self, event):
-        """Start the auto-refresh timer that re-reads the file every X seconds."""
         try:
             interval_seconds = int(self.interval_field.getText())
         except ValueError:
-            print "Invalid interval specified."
+            print("Invalid interval specified.")
             return
 
         if interval_seconds <= 0:
-            print "Interval must be greater than zero."
+            print("Interval must be greater than zero.")
             return
 
-        delay = interval_seconds * 1000  # Timer delay is in milliseconds
-
-        # Stop any previously running timer.
+        delay = interval_seconds * 1000
         if self.autoRefreshTimer is not None:
             self.autoRefreshTimer.stop()
 
-        # Create and start the Swing Timer.
         self.autoRefreshTimer = Timer(delay, self.onAutoRefresh)
         self.autoRefreshTimer.start()
-        print "Auto Refresh started with interval:", interval_seconds, "seconds"
+        print("Auto Refresh started with interval:", interval_seconds, "seconds")
 
     def onAutoRefresh(self, event):
-        """Timer callback to refresh the file automatically."""
         file_path = self.file_path_field.getText()
         if file_path:
             self.readAuthHeader(file_path)
 
     def stopAutoRefresh(self, event):
-        """Stop the auto-refresh timer."""
         if self.autoRefreshTimer is not None:
             self.autoRefreshTimer.stop()
-            print "Auto Refresh stopped."
+            print("Auto Refresh stopped.")
 
-    #
-    # IHttpListener method
-    #
+    def setAllowedHosts(self, event):
+        self.allowed_hosts = self.allowed_hosts_field.getText().strip()
+        print("Allowed hosts updated to:", self.allowed_hosts)
+
+    def setTargetHeader(self, event):
+        """Set the target header to replace."""
+        self.target_header = self.target_header_field.getText().strip()
+        print("Target header updated to:", self.target_header)
+
+    def matchesAllowedHost(self, url):
+        if self.allowed_hosts == "*":
+            return True  
+
+        allowed_patterns = [pattern.strip() for pattern in self.allowed_hosts.split(",")]
+
+        for pattern in allowed_patterns:
+            regex_pattern = pattern.replace(".", r"\.").replace("*", ".*")
+            if re.match("^{}$".format(regex_pattern), url):  
+                return True
+        return False
+
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        # Only process requests (not responses)
         if not messageIsRequest:
             return
 
-        # Get the current request.
         request = messageInfo.getRequest()
         analyzedRequest = self._helpers.analyzeRequest(request)
         headers = list(analyzedRequest.getHeaders())
+        url = messageInfo.getHttpService().getHost()
 
-        # If we have a header from the file, inject it.
-        if self.auth_header:
-            new_headers = []
-            # Remove any existing Authorization header(s)
-            for header in headers:
-                if header.lower().startswith("authorization:"):
-                    continue
-                new_headers.append(header)
-            # Append the new Authorization header.
-            new_headers.append(self.auth_header)
-            
-            # Get the body of the request (if any).
+        target_header_lower = self.target_header.lower()
+
+        if self.auth_header and self.matchesAllowedHost(url):
+            new_headers = [
+                header for header in headers if not header.lower().startswith(target_header_lower + ":")
+            ]
+            new_headers.append("{}: {}".format(self.target_header, self.auth_header))
+
             body = request[analyzedRequest.getBodyOffset():]
-            # Rebuild the HTTP message with the new headers.
             new_request = self._helpers.buildHttpMessage(new_headers, body)
             messageInfo.setRequest(new_request)
+
