@@ -215,6 +215,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         if interval_seconds <= 0:
             print("Interval must be greater than zero.")
             return
+
+        # Run an immediate refresh to pick up any changes in the command field.
+        file_path = self.file_path_field.getText().strip()
+        if file_path:
+            self.runCommandAndRefreshWorker(file_path)
+        
         self.autoRefreshActive = True
         delay = interval_seconds * 1000
         if self.autoRefreshTimer is not None:
