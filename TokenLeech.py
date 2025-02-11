@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from burp import IBurpExtender, ITab, IHttpListener
-from javax.swing import JPanel, JButton, JFileChooser, JLabel, JTextField, JTextArea, Timer, JScrollPane, SwingUtilities, SwingWorker, JCheckBox
+from javax.swing import JPanel, JButton, JFileChooser, JLabel, JTextField, JTextArea, Timer, JScrollPane, SwingUtilities, SwingWorker, JCheckBox, JOptionPane
 from java.awt import FlowLayout, Dimension
 from javax.swing import BoxLayout
 from javax.swing.filechooser import FileNameExtensionFilter
@@ -8,6 +8,7 @@ from java.awt import BorderLayout
 import re
 import os
 import commands  # Using Jython's commands module
+import datetime
 
 '''
 This Burp Suite extension injects HTTP headers into requests by reading values from a file.
@@ -53,31 +54,41 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
 
         # Allowed Hosts UI Section 
         filter_panel = JPanel(FlowLayout(FlowLayout.LEFT))
-        filter_panel.add(JLabel("Allowed Host (Prevents sensitive headers from being sent to 3rd party services): "))
+        allowed_hosts_label = JLabel("Allowed Host (Prevents sensitive headers from being sent to 3rd party services): ")
+        filter_panel.add(allowed_hosts_label)
         self.allowed_hosts_field = JTextField(20)
         self.allowed_hosts_field.setPreferredSize(Dimension(200, 25))
+        self.allowed_hosts_field.setToolTipText("Enter allowed host patterns (e.g., '*' for all or 'example.com' for a specific host). Use commas for multiple hosts.")
         self.set_hosts_button = JButton("Set Allowed Hosts", actionPerformed=self.setAllowedHosts)
+        self.set_hosts_button.setToolTipText("Click to update the allowed hosts for header injection.")
         filter_panel.add(self.allowed_hosts_field)
         filter_panel.add(self.set_hosts_button)
         main_panel.add(filter_panel)
 
         # Header Selection UI Section
         header_panel = JPanel(FlowLayout(FlowLayout.LEFT))
-        header_panel.add(JLabel("Header to Replace (e.g., Authorization, X-API-Key):"))
+        header_label = JLabel("Header to Replace (e.g., Authorization, X-API-Key):")
+        header_panel.add(header_label)
         self.target_header_field = JTextField(20)
         self.target_header_field.setPreferredSize(Dimension(200, 25))
+        self.target_header_field.setToolTipText("Specify the header name that you want to update.")
         self.set_header_button = JButton("Set Header", actionPerformed=self.setTargetHeader)
+        self.set_header_button.setToolTipText("Click to update the target header name.")
         header_panel.add(self.target_header_field)
         header_panel.add(self.set_header_button)
         main_panel.add(header_panel)
 
         # File Selection UI Section 
         file_panel = JPanel(FlowLayout(FlowLayout.LEFT))
-        file_panel.add(JLabel("File Containing Header Value:"))
+        file_label = JLabel("File Containing Header Value:")
+        file_panel.add(file_label)
         self.file_path_field = JTextField(20)
         self.file_path_field.setPreferredSize(Dimension(200, 25))
+        self.file_path_field.setToolTipText("Path to the file that holds the header value.")
         self.load_button = JButton("Select File", actionPerformed=self.loadFile)
+        self.load_button.setToolTipText("Click to choose a file containing the header value.")
         self.refresh_button = JButton("Read File", actionPerformed=self.refreshFile)
+        self.refresh_button.setToolTipText("Click to manually read the file and update the header value.")
         file_panel.add(self.file_path_field)
         file_panel.add(self.load_button)
         file_panel.add(self.refresh_button)
@@ -85,21 +96,32 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
 
         # Command Execution UI Section
         command_panel = JPanel(FlowLayout(FlowLayout.LEFT))
-        command_panel.add(JLabel("Command to Execute (Optional):"))
+        command_label = JLabel("Command to Execute (Optional):")
+        command_panel.add(command_label)
         self.command_field = JTextField(50)
         self.command_field.setPreferredSize(Dimension(400, 25))
+        self.command_field.setToolTipText("Enter a command to execute before reading the file (e.g., to update the file contents).")
         command_panel.add(self.command_field)
+        # New Refresh button added next to the command input:
+        self.command_refresh_button = JButton("Refresh", actionPerformed=self.refreshFile)
+        self.command_refresh_button.setToolTipText("Click to execute the command (if provided) and refresh the header value from the file.")
+        command_panel.add(self.command_refresh_button)
         main_panel.add(command_panel)
 
         # Auto-Refresh UI Section
         refresh_panel = JPanel(FlowLayout(FlowLayout.LEFT))
-        refresh_panel.add(JLabel("Auto Refresh Interval (seconds):"))
+        auto_label = JLabel("Auto Refresh Interval (seconds):")
+        refresh_panel.add(auto_label)
         self.interval_field = JTextField("10", 5)
         self.interval_field.setPreferredSize(Dimension(60, 25))
+        self.interval_field.setToolTipText("Set the interval (in seconds) at which the file will be automatically refreshed.")
         self.start_timer_button = JButton("Start Auto Refresh", actionPerformed=self.startAutoRefresh)
+        self.start_timer_button.setToolTipText("Start automatically refreshing the file at the specified interval.")
         self.stop_timer_button = JButton("Stop Auto Refresh", actionPerformed=self.stopAutoRefresh)
-        # Add a checkbox to control whether to execute the command during auto-refresh.
+        self.stop_timer_button.setToolTipText("Stop the automatic refresh process.")
+        # Checkbox to control command execution on auto-refresh
         self.exec_command_checkbox = JCheckBox("Execute command before reading file", True)
+        self.exec_command_checkbox.setToolTipText("Check to execute the command (if provided) before refreshing the file on auto-refresh.")
         refresh_panel.add(self.interval_field)
         refresh_panel.add(self.start_timer_button)
         refresh_panel.add(self.stop_timer_button)
@@ -107,11 +129,36 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         main_panel.add(refresh_panel)
 
         # File Contents Display UI Section
+        contents_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        contents_label = JLabel("File Contents:")
+        contents_panel.add(contents_label)
         self.file_contents_area = JTextArea(5, 50)
         self.file_contents_area.setEditable(False)
-        scroll_pane = JScrollPane(self.file_contents_area)
-        scroll_pane.setPreferredSize(Dimension(400, 80))
-        main_panel.add(scroll_pane)
+        self.file_contents_area.setToolTipText("Displays the current value read from the file.")
+        contents_scroll_pane = JScrollPane(self.file_contents_area)
+        contents_scroll_pane.setPreferredSize(Dimension(400, 80))
+        contents_panel.add(contents_scroll_pane)
+        main_panel.add(contents_panel)
+
+        # Help/Info Button Section
+        info_panel = JPanel(FlowLayout(FlowLayout.RIGHT))
+        self.info_button = JButton("Info", actionPerformed=self.showInfo)
+        self.info_button.setToolTipText("Click for detailed information about what each control does.")
+        info_panel.add(self.info_button)
+        main_panel.add(info_panel)
+
+        # Output Log Display UI Section
+        log_panel = JPanel()
+        log_panel.setLayout(BoxLayout(log_panel, BoxLayout.Y_AXIS))
+        log_label = JLabel("Output Log:")
+        log_panel.add(log_label)
+        self.output_log_area = JTextArea(10, 50)
+        self.output_log_area.setEditable(False)
+        self.output_log_area.setToolTipText("Displays all log output with timestamps.")
+        log_scroll_pane = JScrollPane(self.output_log_area)
+        log_scroll_pane.setPreferredSize(Dimension(400, 150))
+        log_panel.add(log_scroll_pane)
+        main_panel.add(log_panel)
 
         self.panel.add(main_panel, BorderLayout.NORTH)
 
@@ -123,6 +170,31 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
 
     def getUiComponent(self):
         return self.panel
+
+    def log(self, message):
+        """Append a message with a timestamp to the output log UI component."""
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = "[{}] {}\n".format(timestamp, message)
+        # Ensure UI update happens on the Swing thread.
+        SwingUtilities.invokeLater(lambda: self.output_log_area.append(log_message))
+        # Optionally, also print to the console:
+        print(log_message)
+
+    def showInfo(self, event):
+        info_message = (
+            "Token Leech Extension Info:\n\n"
+            "Allowed Hosts: Specify which hosts are allowed to receive the updated header. "
+            "Use '*' to allow all hosts or specify specific hosts (comma separated).\n\n"
+            "Header to Replace: The name of the header (e.g., 'Authorization') that will be replaced in the requests.\n\n"
+            "File Containing Header Value: Select the file that contains the header value. "
+            "The file should have a single header in the format 'Header-Name: Value'.\n\n"
+            "Command to Execute: (Optional) A command to run before reading the file. This can be used to update the file contents dynamically.\n\n"
+            "Refresh Buttons: Use either 'Read File' or the 'Refresh' button next to the command field to update the header value immediately.\n\n"
+            "Auto Refresh Interval: Set the interval (in seconds) for automatically refreshing the file. Use the Start/Stop buttons to control this.\n\n"
+            "File Contents Display: Shows the current value read from the file.\n\n"
+            "Output Log: Displays all log output along with timestamps."
+        )
+        JOptionPane.showMessageDialog(self.panel, info_message, "Token Leech - Information", JOptionPane.INFORMATION_MESSAGE)
 
     def loadFile(self, event):
         chooser = JFileChooser()
@@ -153,14 +225,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             # Execute the command if provided and if the checkbox is selected.
             if self.command and self.ext.exec_command_checkbox.isSelected():
                 try:
-                    print("Executing command: " + self.command)
+                    self.ext.log("Executing command: " + self.command)
                     status, output = commands.getstatusoutput(self.command)
-                    print("Command executed, status:", status)
-                    print("Command output:\n" + output)
+                    self.ext.log("Command executed, status: " + str(status))
+                    self.ext.log("Command output:\n" + output)
                 except Exception as e:
-                    print("Error executing command: " + str(e))
+                    self.ext.log("Error executing command: " + str(e))
             else:
-                print("Skipping command execution on auto-refresh.")
+                self.ext.log("Skipping command execution on auto-refresh.")
 
             try:
                 if not os.path.isfile(self.file_path):
@@ -181,9 +253,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 result = self.get()
             except Exception as e:
                 result = "Error retrieving result: " + str(e)
-            self.ext.auth_header = result if not result.startswith("Error loading file:") else None
+            if not result.startswith("Error loading file:"):
+                self.ext.auth_header = result
+            else:
+                self.ext.auth_header = None
             self.ext.file_contents_area.setText(result)
-            print("Header value loaded:", result)
+            self.ext.log("Header value loaded: " + result)
 
     def readAuthHeader(self, file_path):
         file_path = file_path.strip()
@@ -198,11 +273,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 header_parts = contents.split(":", 1)
                 contents = header_parts[1].strip()
             self.auth_header = contents
-            print("Header value loaded:", self.auth_header)
+            self.log("Header value loaded: " + self.auth_header)
             self.file_contents_area.setText(contents)
         except Exception as e:
             error_message = "Error loading file: " + str(e)
-            print(error_message)
+            self.log(error_message)
             self.auth_header = None
             self.file_contents_area.setText(error_message)
 
@@ -210,10 +285,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         try:
             interval_seconds = int(self.interval_field.getText())
         except ValueError:
-            print("Invalid interval specified.")
+            self.log("Invalid interval specified.")
             return
         if interval_seconds <= 0:
-            print("Interval must be greater than zero.")
+            self.log("Interval must be greater than zero.")
             return
 
         # Run an immediate refresh to pick up any changes in the command field.
@@ -227,7 +302,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             self.autoRefreshTimer.stop()
         self.autoRefreshTimer = Timer(delay, self.onAutoRefresh)
         self.autoRefreshTimer.start()
-        print("Auto Refresh started with interval:", interval_seconds, "seconds")
+        self.log("Auto Refresh started with interval: " + str(interval_seconds) + " seconds")
 
     def onAutoRefresh(self, event):
         if not self.autoRefreshActive:
@@ -241,15 +316,15 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         if self.autoRefreshTimer is not None:
             self.autoRefreshTimer.stop()
             self.autoRefreshTimer = None
-        print("Auto Refresh stopped.")
+        self.log("Auto Refresh stopped.")
 
     def setAllowedHosts(self, event):
         self.allowed_hosts = self.allowed_hosts_field.getText().strip()
-        print("Allowed hosts updated to:", self.allowed_hosts)
+        self.log("Allowed hosts updated to: " + self.allowed_hosts)
 
     def setTargetHeader(self, event):
         self.target_header = self.target_header_field.getText().strip()
-        print("Target header updated to:", self.target_header)
+        self.log("Target header updated to: " + self.target_header)
 
     def matchesAllowedHost(self, url):
         if self.allowed_hosts == "*":
