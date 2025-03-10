@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from burp import IBurpExtender, ITab, IHttpListener
+from burp import IBurpExtender, ITab, IHttpListener, IExtensionStateListener
 from javax.swing import JPanel, JButton, JFileChooser, JLabel, JTextField, JTextArea, Timer, JScrollPane, SwingUtilities, SwingWorker, JCheckBox, JOptionPane
 from java.awt import FlowLayout, Dimension
 from javax.swing import BoxLayout
@@ -9,10 +9,12 @@ import re
 import os
 import commands  # Using Jython's commands module
 import datetime
+import pickle
 
 '''
 This Burp Suite extension injects HTTP headers into requests by reading values from a file.
 It is useful for dynamically updating authentication tokens or API keys from CLI tools, scripts, or external sources.
+All settings are persisted between Burp restarts.
 
 Example:
     aws sso get-bearer-token > token.txt
@@ -34,7 +36,68 @@ How It Works:
     If the file contains multiple lines or additional colons, only the first occurrence of Header-Name: Value is processed.
 '''
 
-class BurpExtender(IBurpExtender, ITab, IHttpListener):
+class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
+
+    # Settings persistence implementation
+    def saveSettings(self):
+        """Save all user settings to Burp's extension settings."""
+        try:
+            settings = {
+                'file_path': self.file_path_field.getText(),
+                'command': self.command_field.getText(),
+                'allowed_hosts': self.allowed_hosts_field.getText(),
+                'target_header': self.target_header_field.getText(),
+                'interval': self.interval_field.getText(),
+                'exec_command': self.exec_command_checkbox.isSelected()
+            }
+            
+            # Serialize settings to string
+            serialized = pickle.dumps(settings)
+            
+            # Save to Burp's persistent storage
+            self._callbacks.saveExtensionSetting("settings", serialized)
+            self.log("Settings saved successfully")
+        except Exception as e:
+            self.log("Error saving settings: " + str(e))
+
+    def loadSettings(self):
+        """Load all user settings from Burp's extension settings."""
+        try:
+            serialized = self._callbacks.loadExtensionSetting("settings")
+            if serialized:
+                settings = pickle.loads(serialized)
+                
+                # Apply loaded settings to UI components
+                if 'file_path' in settings and settings['file_path']:
+                    self.file_path_field.setText(settings['file_path'])
+                
+                if 'command' in settings and settings['command']:
+                    self.command_field.setText(settings['command'])
+                
+                if 'allowed_hosts' in settings and settings['allowed_hosts']:
+                    self.allowed_hosts_field.setText(settings['allowed_hosts'])
+                    self.allowed_hosts = settings['allowed_hosts']
+                
+                if 'target_header' in settings and settings['target_header']:
+                    self.target_header_field.setText(settings['target_header'])
+                    self.target_header = settings['target_header']
+                
+                if 'interval' in settings and settings['interval']:
+                    self.interval_field.setText(settings['interval'])
+                
+                if 'exec_command' in settings:
+                    self.exec_command_checkbox.setSelected(settings['exec_command'])
+                
+                self.log("Settings loaded successfully")
+                
+                # Read the auth header file if a path is set
+                file_path = self.file_path_field.getText().strip()
+                if file_path:
+                    self.readAuthHeader(file_path)
+            else:
+                self.log("No saved settings found")
+        except Exception as e:
+            self.log("Error loading settings: " + str(e))
 
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
@@ -144,6 +207,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         info_panel = JPanel(FlowLayout(FlowLayout.RIGHT))
         self.info_button = JButton("Info", actionPerformed=self.showInfo)
         self.info_button.setToolTipText("Click for detailed information about what each control does.")
+        # Add a Save Settings button
+        self.save_settings_button = JButton("Save Settings", actionPerformed=self.onSaveSettings)
+        self.save_settings_button.setToolTipText("Click to save all current settings for persistence.")
+        info_panel.add(self.save_settings_button)
         info_panel.add(self.info_button)
         main_panel.add(info_panel)
 
@@ -164,6 +231,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
 
         callbacks.addSuiteTab(self)
         callbacks.registerHttpListener(self)
+        callbacks.registerExtensionStateListener(self)
+        
+        # Load saved settings after UI initialization
+        self.loadSettings()
+
+    def onSaveSettings(self, event):
+        """Handle the save settings button click."""
+        self.saveSettings()
 
     def getTabCaption(self):
         return "Token Leech"
@@ -192,7 +267,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             "Refresh Buttons: Use either 'Read File' or the 'Refresh' button next to the command field to update the header value immediately.\n\n"
             "Auto Refresh Interval: Set the interval (in seconds) for automatically refreshing the file. Use the Start/Stop buttons to control this.\n\n"
             "File Contents Display: Shows the current value read from the file.\n\n"
-            "Output Log: Displays all log output along with timestamps."
+            "Output Log: Displays all log output along with timestamps.\n\n"
+            "Settings Persistence: All settings are automatically loaded when Burp starts and can be manually saved with the 'Save Settings' button."
         )
         JOptionPane.showMessageDialog(self.panel, info_message, "Token Leech - Information", JOptionPane.INFORMATION_MESSAGE)
 
@@ -205,6 +281,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             file_path = file.getAbsolutePath().strip()
             self.file_path_field.setText(file_path)
             self.readAuthHeader(file_path)
+            # Save settings after file selection
+            self.saveSettings()
 
     def refreshFile(self, event):
         file_path = self.file_path_field.getText().strip()
@@ -303,6 +381,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         self.autoRefreshTimer = Timer(delay, self.onAutoRefresh)
         self.autoRefreshTimer.start()
         self.log("Auto Refresh started with interval: " + str(interval_seconds) + " seconds")
+        
+        # Save settings when auto refresh started
+        self.saveSettings()
 
     def onAutoRefresh(self, event):
         if not self.autoRefreshActive:
@@ -321,10 +402,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
     def setAllowedHosts(self, event):
         self.allowed_hosts = self.allowed_hosts_field.getText().strip()
         self.log("Allowed hosts updated to: " + self.allowed_hosts)
+        # Save settings after updating allowed hosts
+        self.saveSettings()
 
     def setTargetHeader(self, event):
         self.target_header = self.target_header_field.getText().strip()
         self.log("Target header updated to: " + self.target_header)
+        # Save settings after updating target header
+        self.saveSettings()
 
     def matchesAllowedHost(self, url):
         if self.allowed_hosts == "*":
@@ -350,3 +435,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             body = request[analyzedRequest.getBodyOffset():]
             new_request = self._helpers.buildHttpMessage(new_headers, body)
             messageInfo.setRequest(new_request)
+    
+    # Extension state listener methods
+    def extensionUnloaded(self):
+        """Handle extension unloading - save settings before unloading."""
+        self.stopAutoRefresh(None)  # Stop auto-refresh if running
+        self.saveSettings()
+        self.log("Extension unloaded, settings saved")
